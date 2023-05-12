@@ -2132,9 +2132,8 @@ class EOSDriver(NetworkDriver):
         output = self._show_vrf()
 
         vrfs = [str(vrf["name"]) for vrf in output]
-        
-        if "default" not in vrfs:
-            vrfs.append("default")
+
+        vrfs.append("default")
 
         return vrfs
 
