@@ -96,6 +96,8 @@ class EOSDriver(NetworkDriver):
         Optional args:
             * lock_disable (True/False): force configuration lock to be disabled (for external lock
                 management).
+            * force_cfg_session_invalid (True/False): force invalidation of the config session
+                in case of failure.
             * enable_password (True/False): Enable password for privilege elevation
             * eos_autoComplete (True/False): Allow for shortening of cli commands
             * transport (string): transport, eos_transport is a fallback for compatibility.
@@ -134,6 +136,10 @@ class EOSDriver(NetworkDriver):
         # Define locking method
         self.lock_disable = self.optional_args.pop("lock_disable", False)
 
+        self.force_cfg_session_invalid = self.optional_args.pop(
+            "force_cfg_session_invalid", False
+        )
+
         # eos_transport is there for backwards compatibility, transport is the preferred method
         transport = self.optional_args.get(
             "transport", self.optional_args.get("eos_transport", "https")
@@ -150,7 +156,6 @@ class EOSDriver(NetworkDriver):
         self.netmiko_optional_args = netmiko_args(optional_args)
 
     def _process_optional_args_eapi(self, optional_args):
-
         # Parse pyeapi transport class
         self.transport_class = self._parse_transport(self.transport)
 
@@ -543,8 +548,15 @@ class EOSDriver(NetworkDriver):
     def discard_config(self):
         """Implementation of NAPALM method discard_config."""
         if self.config_session is not None:
-            commands = [f"configure session {self.config_session} abort"]
-            self._run_commands(commands, encoding="text")
+            try:
+                commands = [f"configure session {self.config_session} abort"]
+                self._run_commands(commands, encoding="text")
+            except Exception:
+                # If discard fails, you might want to invalidate the config_session (esp. Salt)
+                # The config_session in EOS is used as the config lock.
+                if self.force_cfg_session_invalid:
+                    self.config_session = None
+                raise
             self.config_session = None
 
     def rollback(self):
@@ -895,7 +907,6 @@ class EOSDriver(NetworkDriver):
         return sorted([LLDP_CAPAB_TRANFORM_TABLE[c.lower()] for c in capabilities])
 
     def get_lldp_neighbors_detail(self, interface=""):
-
         lldp_neighbors_out = {}
 
         filters = []
@@ -1073,7 +1084,6 @@ class EOSDriver(NetworkDriver):
             return neighbor_dict
 
         def parse_options(options, default_value=False):
-
             if not options:
                 return {}
 
@@ -1318,7 +1328,6 @@ class EOSDriver(NetworkDriver):
         return ntp_stats
 
     def get_interfaces_ip(self):
-
         interfaces_ip = {}
 
         interfaces_ipv4_out = self._run_commands(["show ip interface"])[0]["interfaces"]
@@ -1415,7 +1424,6 @@ class EOSDriver(NetworkDriver):
         return interfaces_ip
 
     def get_mac_address_table(self):
-
         mac_table = []
 
         commands = ["show mac address-table"]
@@ -1713,7 +1721,6 @@ class EOSDriver(NetworkDriver):
         timeout=c.TRACEROUTE_TIMEOUT,
         vrf=c.TRACEROUTE_VRF,
     ):
-
         _HOP_ENTRY_PROBE = [
             r"\s+",
             r"(",  # beginning of host_name (ip_address) RTT group
@@ -1870,7 +1877,6 @@ class EOSDriver(NetworkDriver):
             )
 
             for item in peer_info:
-
                 # Determining a few other fields in the final peer_info
                 item["up"] = True if item["up"] == "up" else False
                 item["local_address_configured"] = (
@@ -1930,7 +1936,6 @@ class EOSDriver(NetworkDriver):
             return peer_details
 
         def _append(bgp_dict, peer_info):
-
             remote_as = peer_info["remote_as"]
             vrf_name = peer_info["routing_table"]
 
@@ -1983,7 +1988,6 @@ class EOSDriver(NetworkDriver):
             v6_peer_info = _parse_per_peer_bgp_detail(raw_output[1]["output"])
 
         for peer_info in v4_peer_info:
-
             vrf_name = peer_info["routing_table"]
             peer_remote_addr = peer_info["remote_address"]
             peer_info["accepted_prefix_count"] = (
@@ -1997,7 +2001,6 @@ class EOSDriver(NetworkDriver):
             _append(bgp_detail_info, peer_info)
 
         for peer_info in v6_peer_info:
-
             vrf_name = peer_info["routing_table"]
             peer_remote_addr = peer_info["remote_address"]
             peer_info["accepted_prefix_count"] = (
@@ -2013,7 +2016,6 @@ class EOSDriver(NetworkDriver):
         return bgp_detail_info
 
     def get_optics(self):
-
         command = ["show interfaces transceiver"]
 
         output = self._run_commands(command, encoding="json")[0]["interfaces"]
@@ -2118,15 +2120,59 @@ class EOSDriver(NetworkDriver):
         else:
             raise Exception("Wrong retrieve filter: {}".format(retrieve))
 
-    def _show_vrf(self):
+    def _show_vrf_json(self):
         commands = ["show vrf"]
 
-        # This command has no JSON yet
+        vrfs = self._run_commands(commands)[0]["vrfs"]
+        return [
+            {
+                "name": k,
+                "interfaces": [i for i in v["interfaces"]],
+                "route_distinguisher": v["routeDistinguisher"],
+            }
+            for k, v in vrfs.items()
+        ]
+
+    def _show_vrf_text(self):
+        commands = ["show vrf"]
+
+        # This command has no JSON in EOS < 4.23
         raw_output = self._run_commands(commands, encoding="text")[0].get("output", "")
 
-        output = napalm.base.helpers.textfsm_extractor(self, "vrf", raw_output)
+        width_line = raw_output.splitlines()[2]  # Line with dashes
+        fields = width_line.split(" ")
+        widths = [len(f) + 1 for f in fields]
+        widths[-1] -= 1
 
-        return output
+        parsed_lines = string_parsers.parse_fixed_width(raw_output, *widths)
+
+        vrfs = []
+        vrf = {}
+        current_vrf = None
+        for line in parsed_lines[3:]:
+            line = [t.strip() for t in line]
+            if line[0]:
+                if current_vrf:
+                    vrfs.append(vrf)
+                current_vrf = line[0]
+                vrf = {
+                    "name": current_vrf,
+                    "interfaces": list(),
+                }
+            if line[1]:
+                vrf["route_distinguisher"] = line[1]
+            if line[4]:
+                vrf["interfaces"].extend([t.strip() for t in line[4].split(",") if t])
+        if current_vrf:
+            vrfs.append(vrf)
+
+        return vrfs
+
+    def _show_vrf(self):
+        if self.cli_version == 2:
+            return self._show_vrf_json()
+        else:
+            return self._show_vrf_text()
 
     def _get_vrfs(self):
         output = self._show_vrf()
@@ -2159,23 +2205,26 @@ class EOSDriver(NetworkDriver):
                         interfaces[str(line.strip())] = {}
                         all_vrf_interfaces[str(line.strip())] = {}
 
-            vrfs[str(vrf["name"])] = {
-                "name": str(vrf["name"]),
-                "type": "L3VRF",
+            vrfs[vrf["name"]] = {
+                "name": vrf["name"],
+                "type": "DEFAULT_INSTANCE" if vrf["name"] == "default" else "L3VRF",
                 "state": {"route_distinguisher": vrf["route_distinguisher"]},
                 "interfaces": {"interface": interfaces},
             }
-        all_interfaces = self.get_interfaces_ip().keys()
-        vrfs["default"] = {
-            "name": "default",
-            "type": "DEFAULT_INSTANCE",
-            "state": {"route_distinguisher": ""},
-            "interfaces": {
-                "interface": {
-                    k: {} for k in all_interfaces if k not in all_vrf_interfaces.keys()
-                }
-            },
-        }
+        if "default" not in vrfs:
+            all_interfaces = self.get_interfaces_ip().keys()
+            vrfs["default"] = {
+                "name": "default",
+                "type": "DEFAULT_INSTANCE",
+                "state": {"route_distinguisher": ""},
+                "interfaces": {
+                    "interface": {
+                        k: {}
+                        for k in all_interfaces
+                        if k not in all_vrf_interfaces.keys()
+                    }
+                },
+            }
 
         if name:
             if name in vrfs:

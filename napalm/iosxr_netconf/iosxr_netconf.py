@@ -451,7 +451,7 @@ class IOSXRNETCONFDriver(NetworkDriver):
         interfaces_rpc_reply_etree = ETREE.fromstring(interfaces_rpc_reply)
 
         # Retrieves interfaces details
-        for (interface_tree, description_tree) in zip(
+        for interface_tree, description_tree in zip(
             interfaces_rpc_reply_etree.xpath(
                 ".//int:interfaces/int:interface-xr/int:interface", namespaces=C.NS
             ),
@@ -459,7 +459,6 @@ class IOSXRNETCONFDriver(NetworkDriver):
                 ".//int:interfaces/int:interfaces/int:interface", namespaces=C.NS
             ),
         ):
-
             interface_name = self._find_txt(
                 interface_tree, "./int:interface-name", default="", namespaces=C.NS
             )
@@ -680,7 +679,6 @@ class IOSXRNETCONFDriver(NetworkDriver):
             neighbors = {}
 
             for neighbor in rpc_reply_etree.xpath(xpath, namespaces=C.NS):
-
                 this_neighbor = {}
                 this_neighbor["local_as"] = napalm.base.helpers.convert(
                     int,
@@ -1365,6 +1363,12 @@ class IOSXRNETCONFDriver(NetworkDriver):
 
         # Converts string to etree
         result_tree = ETREE.fromstring(rpc_reply)
+
+        data_ele = result_tree.find("./{*}data")
+        # If there are no children in "<data>", then there is no BGP configured
+        bgp_configured = bool(len(data_ele.getchildren()))
+        if not bgp_configured:
+            return {}
 
         if not group:
             neighbor = ""
@@ -3148,7 +3152,7 @@ class IOSXRNETCONFDriver(NetworkDriver):
             if config[datastore] != "":
                 if encoding == "cli":
                     cli_tree = ETREE.XML(config[datastore], parser=parser)[0]
-                    if cli_tree:
+                    if len(cli_tree):
                         config[datastore] = cli_tree[0].text.strip()
                     else:
                         config[datastore] = ""
